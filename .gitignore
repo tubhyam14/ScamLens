@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+venv/
+.venv/
+
+# Models
+model/*.keras
+model/*.joblib
+
+# Datasets / SMS data
+data/*.csv
+data/SMSSpamCollection
+data/sms-phishing/
+
+# Local test/output files
+*.log
+.DS_Store
+data/indian_scam_30k/
