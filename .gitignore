@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *.so
 
-# Virtual environment
+# Virtual environments
 venv/
 .venv/
 
@@ -11,12 +11,18 @@ venv/
 model/*.keras
 model/*.joblib
 
-# Datasets / SMS data
+# Keep the two production models
+!model/scamlens_text_v7_svm_calibrated.joblib
+!model/scamlens_url_svm.joblib
+
+# Datasets / raw data
 data/*.csv
 data/SMSSpamCollection
 data/sms-phishing/
+data/url_raw/
 
 # Local test/output files
 *.log
 .DS_Store
 data/indian_scam_30k/
+predict_text_only_backup.py
