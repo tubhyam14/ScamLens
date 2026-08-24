@@ -1,150 +1,128 @@
-import re
-import os
-import joblib
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 
-app = FastAPI(
-    title="ScamLens Intelligence API",
-    description="Explainable Financial Fraud & SMS Threat Analysis Engine",
-    version="1.0.0"
-)
+# Import the core analysis pipeline directly from predict.py
+from predict import analyze_sms
 
-# Enable CORS for React/Web frontend
+app = FastAPI(title="ScamLens AI API", version="2.0.0")
+
+# Enable CORS for the Vite React frontend (running on port 5173)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MODEL_PATH = "model/scamlens_text_v7_svm_calibrated.joblib"
-
-# Load the trained ML model
-if os.path.exists(MODEL_PATH):
-    model = joblib.load(MODEL_PATH)
-    print("✓ Model loaded successfully!")
-else:
-    model = None
-    print(f"! Warning: Model not found at {MODEL_PATH}")
-
-# --- Pydantic Data Models ---
-class MessagePayload(BaseModel):
+class AnalyzeRequest(BaseModel):
     text: str
 
-class AnalysisResponse(BaseModel):
-    text: str
-    scam_probability: float
-    prediction: str
+class URLDetail(BaseModel):
+    original_url: str
+    final_url: str
+    score: float
+    risk: str
+    reasons: List[str]
+
+class AnalyzeResponse(BaseModel):
+    is_scam: bool
     risk_level: str
-    extracted_amount: Optional[str]
-    detected_triggers: List[str]
+    score: float
+    text_score: float
     ai_explanation: str
+    detected_triggers: List[str]
     recommended_action: str
+    urls_found: List[URLDetail]
 
+def format_score(score: float) -> str:
+    return str(int(score)) if score.is_integer() else f"{score:.2f}"
 
-# --- Heuristic & Explainability Engine ---
-def analyze_risk_factors(text: str, probability: float):
-    lower_text = text.lower()
-    triggers = []
-    
-    # 1. URL Shorteners & Phishing Links
-    url_pattern = r"(https?://\S+|bit\.ly/\S+|cutt\.ly/\S+|tinyurl\.com/\S+|t\.co/\S+)"
-    urls = re.findall(url_pattern, text)
-    if urls:
-        if any(short in lower_text for short in ["bit.ly", "cutt.ly", "tinyurl", "t.co"]):
-            triggers.append("Obfuscated/Shortened URL detected (hides actual destination)")
-        else:
-            triggers.append("External hyperlink detected")
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze_message(request: AnalyzeRequest):
+    text = request.text.strip()
+    if not text:
+        return AnalyzeResponse(
+            is_scam=False,
+            risk_level="LOW",
+            score=0.0,
+            text_score=0.0,
+            ai_explanation="No message content provided.",
+            detected_triggers=[],
+            recommended_action="Paste a suspicious SMS or email to scan.",
+            urls_found=[]
+        )
 
-    # 2. Urgency & Account Threat Triggers
-    urgency_keywords = ["urgent", "immediately", "today", "blocked", "suspended", "disconnected", "deactivated", "24 hours"]
-    found_urgency = [w for w in urgency_keywords if w in lower_text]
-    if found_urgency:
-        triggers.append(f"High-pressure urgency tactics ('{', '.join(found_urgency[:2])}')")
+    # Run the machine learning pipeline
+    text_prob, text_pred, text_risk, url_results = analyze_sms(text)
+    text_score = round(text_prob * 100, 2)
 
-    # 3. Credential & Verification Lures
-    credential_keywords = ["kyc", "pan card", "aadhaar", "otp", "one time password", "pin", "verify account", "update details"]
-    found_credentials = [w for w in credential_keywords if w in lower_text]
-    if found_credentials:
-        triggers.append(f"Requests sensitive identity/banking actions ('{', '.join(found_credentials[:2])}')")
+    # Compute final combined scoring logic matching predict.py
+    if not url_results:
+        final_score = text_score * 0.75
+    else:
+        max_url_score = max(r.get("score", 0.0) for r in url_results)
+        final_score = max(text_score * 0.60 + max_url_score * 0.40, max_url_score)
 
-    # 4. Reward & Unrealistic Incentive Lures
-    lottery_keywords = ["congratulations", "lottery", "won", "bonus", "cashback", "gift", "work-from-home", "wfh", "earn per month"]
-    found_lottery = [w for w in lottery_keywords if w in lower_text]
-    if found_lottery:
-        triggers.append("Unrealistic financial incentives or lottery lures")
+    final_score = round(final_score, 2)
 
-    # 5. Extract Financial Figures
-    amount_match = re.search(r"(?:rs\.?|inr|₹)\s?([\d,]+(?:\.\d{2})?)", lower_text)
-    extracted_amount = amount_match.group(0).upper() if amount_match else None
-
-    # --- Generate Human-Readable AI Explanations ---
-    if probability >= 80:
+    # Determine risk verdict
+    if final_score >= 70:
         risk_level = "HIGH"
-        explanation = (
-            "This message shows severe indicators of financial fraud. It combines artificial urgency "
-            "with requests for sensitive actions or unverified external links to compromise your account."
-        )
-        action = "DO NOT click any links, share OTPs, or transfer money. Block and report this sender immediately."
-    elif probability >= 50:
+        is_scam = True
+        recommended_action = "DO NOT click links, share OTPs, or transfer money. Block and report the sender."
+    elif final_score >= 40:
         risk_level = "MEDIUM"
-        explanation = (
-            "This message contains ambiguous or suspicious elements that match known phishing templates, "
-            "though some legitimate notifications share similar language."
-        )
-        action = "Verify the request directly through the official bank app or merchant portal. Avoid using contact details from this message."
+        is_scam = True
+        recommended_action = "Proceed with caution. Verify the sender through official channels before responding."
     else:
         risk_level = "LOW"
+        is_scam = False
+        recommended_action = "No immediate threats detected. Maintain general security practices."
+
+    # Aggregate triggers and reasons
+    triggers = []
+    if text_risk in ["HIGH", "MEDIUM"]:
+        triggers.append(f"Text pattern flagged as suspicious ({text_score}% scam probability)")
+    
+    for url_res in url_results:
+        for reason in url_res.get("reasons", []):
+            if reason not in triggers:
+                triggers.append(f"URL Flag: {reason}")
+
+# Build human-readable explanation
+    formatted_final = format_score(final_score)
+    if is_scam:
         explanation = (
-            "The message matches standard transaction notifications or routine communication. "
-            "No common fraudulent patterns were identified."
+            f"Analysis completed with a risk score of {formatted_final}/100. "
+            f"The message contains behavioral patterns or URL indicators commonly associated with fraud."
         )
-        action = "No immediate security risk detected. Standard caution is always recommended."
-
-    return risk_level, extracted_amount, triggers, explanation, action
-
-
-# --- API Endpoints ---
-@app.get("/")
-def health_check():
-    return {
-        "status": "online",
-        "service": "ScamLens Intelligence API",
-        "model_loaded": model is not None
-    }
-
-@app.post("/analyze", response_model=AnalysisResponse)
-def analyze_message(payload: MessagePayload):
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model file missing. Ensure model/scamlens_text_v7_svm_calibrated.joblib exists."
+    else:
+        explanation = (
+            f"Analysis completed with a low risk score of {formatted_final}/100. "
+            f"No high-confidence phishing indicators or malicious URLs were detected."
         )
 
-    clean_text = payload.text.strip()
-    if not clean_text:
-        raise HTTPException(status_code=400, detail="Text field cannot be empty.")
+    formatted_urls = [
+        URLDetail(
+            original_url=r.get("original_url", ""),
+            final_url=r.get("final_url", ""),
+            score=round(r.get("score", 0.0), 2),
+            risk=r.get("risk", "UNKNOWN"),
+            reasons=r.get("reasons", [])
+        )
+        for r in url_results
+    ]
 
-    # Model inference
-    prob_scam = float(model.predict_proba([clean_text])[0][1]) * 100.0
-    is_scam = prob_scam >= 50.0
-
-    # Risk factor extraction
-    risk_level, extracted_amount, triggers, explanation, action = analyze_risk_factors(
-        clean_text, prob_scam
+    return AnalyzeResponse(
+        is_scam=is_scam,
+        risk_level=risk_level,
+        score=final_score,
+        text_score=text_score,
+        ai_explanation=explanation,
+        detected_triggers=triggers,
+        recommended_action=recommended_action,
+        urls_found=formatted_urls
     )
-
-    return {
-        "text": clean_text,
-        "scam_probability": round(prob_scam, 2),
-        "prediction": "SCAM" if is_scam else "LEGITIMATE",
-        "risk_level": risk_level,
-        "extracted_amount": extracted_amount,
-        "detected_triggers": triggers,
-        "ai_explanation": explanation,
-        "recommended_action": action
-    }
